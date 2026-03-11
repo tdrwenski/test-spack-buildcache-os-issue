@@ -1,0 +1,116 @@
+name: repro-buildcache-os-mismatch
+
+on:
+  workflow_dispatch:
+
+jobs:
+  buildcache_macos_14:
+    runs-on: macos-14
+    steps:
+      - name: Checkout Spack v1.1.1
+        run: |
+          git clone --depth 1 --branch v1.1.1 https://github.com/spack/spack.git
+          echo "SPACK_ROOT=$PWD/spack" >> $GITHUB_ENV
+
+      - name: Setup Spack and show OS detection
+        run: |
+          . "$SPACK_ROOT/share/spack/setup-env.sh"
+          echo "Env hints:"
+          echo "  MACOSX_DEPLOYMENT_TARGET=${MACOSX_DEPLOYMENT_TARGET-<unset>}"
+          echo "  SYSTEM_VERSION_COMPAT=${SYSTEM_VERSION_COMPAT-<unset>}"
+          echo "sw_vers (default):"
+          sw_vers || true
+          echo "sw_vers (SYSTEM_VERSION_COMPAT=0):"
+          SYSTEM_VERSION_COMPAT=0 sw_vers || true
+          spack arch -f
+          spack debug report
+
+      - name: Concretize + build one package from source
+        run: |
+          . "$SPACK_ROOT/share/spack/setup-env.sh"
+          spack spec -I zlib
+          spack install zlib
+          spack find -v zlib
+
+      - name: Create local binary buildcache mirror
+        run: |
+          . "$SPACK_ROOT/share/spack/setup-env.sh"
+          mkdir -p mirror
+          spack mirror add --type binary --unsigned local-buildcache "file://$(pwd)/mirror"
+          spack buildcache push --unsigned --update-index -f local-buildcache zlib
+          echo "Mirror contents:"
+          find mirror -maxdepth 4 -type f | sed 's|^|  |'
+
+      - name: Upload mirror as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: spack-mirror-macos-14
+          path: mirror
+
+  consume_buildcache_macos_15:
+    runs-on: macos-15
+    needs: buildcache_macos_14
+    env:
+      # Avoid "compatibility mode" / deployment-target overrides influencing
+      # Spack OS detection on the consumer side.
+      MACOSX_DEPLOYMENT_TARGET: ""
+      SYSTEM_VERSION_COMPAT: "0"
+    steps:
+      - name: Checkout Spack v1.1.1
+        run: |
+          git clone --depth 1 --branch v1.1.1 https://github.com/spack/spack.git
+          echo "SPACK_ROOT=$PWD/spack" >> $GITHUB_ENV
+
+      - name: Download mirror artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: spack-mirror-macos-14
+          path: mirror
+
+      - name: Setup Spack and show OS detection
+        run: |
+          . "$SPACK_ROOT/share/spack/setup-env.sh"
+          echo "Env hints:"
+          echo "  MACOSX_DEPLOYMENT_TARGET=${MACOSX_DEPLOYMENT_TARGET-<unset>}"
+          echo "  SYSTEM_VERSION_COMPAT=${SYSTEM_VERSION_COMPAT-<unset>}"
+          echo "sw_vers (default):"
+          sw_vers || true
+          echo "sw_vers (SYSTEM_VERSION_COMPAT=0):"
+          SYSTEM_VERSION_COMPAT=0 sw_vers || true
+          spack arch
+          spack debug report
+          echo "Mirror index snippet:"
+          find mirror -maxdepth 3 -type f -name "index.json" -o -name "index.json.sig" | sed 's|^|  |' || true
+
+      - name: Add mirror and try to install cache-only
+        run: |
+          . "$SPACK_ROOT/share/spack/setup-env.sh"
+
+          echo "Spec before adding buildcache mirror:"
+          spack spec -I zlib
+
+          echo "Adding buildcache mirror..."
+          spack mirror add --type binary --unsigned local-buildcache "file://$(pwd)/mirror"
+          spack buildcache list -a -l zlib || true
+
+          echo "Spec after adding buildcache mirror:"
+          spack spec -I zlib
+
+          # If Spack thinks the binary matches this host, it will install.
+          # If it thinks the binary is incompatible (e.g., OS mismatch), this should fail.
+          # Treat a successful install as a reproduction of the bug.
+          if spack install --use-buildcache only --no-check-signature zlib; then
+            echo "ERROR: buildcache install succeeded even though consumer is sequoia and mirror entry is sonoma." >&2
+            exit 1
+          else
+            echo "OK: cache-only install failed as expected for OS mismatch."
+          fi
+
+          echo "Installed packages:"
+          spack find
+
+      - name: Extra debug show matching / concretization details
+        if: always()
+        run: |
+          . "$SPACK_ROOT/share/spack/setup-env.sh"
+          spack -d spec -I zlib || true
