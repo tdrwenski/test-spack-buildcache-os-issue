@@ -2,14 +2,19 @@ name: repro-buildcache-os-keyerror
 
 # Reproduces the bug fixed by os-buildcache-fix (Spack issue #52062):
 # source-building a spec with os=sonoma on a sequoia host crashes with
-# `KeyError: 'sonoma'` in Darwin.setup_platform_environment because only
-# the host's OS is registered in operating_sys. The patch pre-registers
-# recent macOS versions so the lookup succeeds.
+# `KeyError: 'sonoma'` in Darwin.setup_platform_environment. The patch
+# pre-registers recent macOS versions so the lookup succeeds.
 #
-# Producer (macos-14): builds bzip2 + deps as os=sonoma, pushes only the
-# deps to a mirror so the consumer must source-build bzip2.
-# Consumer (macos-15, patched): installs bzip2 os=sonoma with deps from
-# cache and package source-built. Asserts the install succeeds.
+# Producer (macos-14): builds bzip2 %gcc and pushes everything to a
+# mirror (bzip2 + deps, all os=sonoma).
+# Consumer (macos-15): installs `bzip2 ~shared %gcc` — the variant flip
+# means bzip2's hash differs from the cached entry, forcing source
+# build, while its deps still match the cache and are reused as
+# os=sonoma. %gcc is used instead of apple-clang so the compiler-OS
+# coupling doesn't pin bzip2 to the host. If the concretizer keeps
+# os=sonoma for bzip2 due to DAG cohesion with the cached deps, the
+# source build hits the KeyError on unpatched Spack and succeeds on
+# the patched branch.
 
 on:
   workflow_dispatch:
@@ -49,21 +54,25 @@ jobs:
           spack arch -f
           spack debug report
 
-      - name: Build bzip2 from source (deps inherit os=sonoma)
+      - name: Register Homebrew gcc as an external compiler
         run: |
           . "$SPACK_ROOT/share/spack/setup-env.sh"
-          spack spec -I bzip2
-          spack install bzip2
+          spack external find gcc
+          spack compiler list || true
+
+      - name: Build bzip2 %gcc from source (all nodes os=sonoma)
+        run: |
+          . "$SPACK_ROOT/share/spack/setup-env.sh"
+          spack spec -I bzip2 %gcc
+          spack install bzip2 %gcc
           spack find -v
 
-      - name: Push only the deps of bzip2 to a local buildcache mirror
+      - name: Push bzip2 and its full dep tree to the buildcache mirror
         run: |
           . "$SPACK_ROOT/share/spack/setup-env.sh"
           mkdir -p mirror
           spack mirror add --type binary --unsigned local-buildcache "file://$(pwd)/mirror"
-          # --only=dependencies pushes bzip2's dep tree but not bzip2 itself.
-          # This forces the consumer to source-build bzip2.
-          spack buildcache push --unsigned --update-index --only=dependencies -f local-buildcache bzip2
+          spack buildcache push --unsigned --update-index -f local-buildcache bzip2
           echo "Mirror contents:"
           find mirror -maxdepth 4 -type f | sed 's|^|  |'
 
@@ -108,27 +117,32 @@ jobs:
           echo "Mirror index files:"
           find mirror -maxdepth 4 -type f -name "index.json*" | sed 's|^|  |' || true
 
-      - name: Add mirror and force source-build of bzip2 with os=sonoma
+      - name: Register Homebrew gcc as an external compiler
+        run: |
+          . "$SPACK_ROOT/share/spack/setup-env.sh"
+          spack external find gcc
+          spack compiler list || true
+
+      - name: Add mirror and install bzip2 ~shared %gcc (variant flip)
         run: |
           . "$SPACK_ROOT/share/spack/setup-env.sh"
 
           spack mirror add --type binary --unsigned local-buildcache "file://$(pwd)/mirror"
 
-          echo "Buildcache contents (deps built on macOS 14 = os=sonoma):"
+          echo "Buildcache contents (built on macOS 14 = os=sonoma):"
           spack buildcache list -a -l
 
-          echo "Concretizing bzip2 os=sonoma..."
-          spack spec -I bzip2 os=sonoma
+          # The variant flip (~shared) makes bzip2's hash differ from the
+          # cached entry, forcing source build. Deps still match the cache
+          # and should be reused as os=sonoma. The hope: the concretizer
+          # keeps os=sonoma for bzip2 too (DAG cohesion with cached deps),
+          # which would trigger the KeyError on unpatched Spack and succeed
+          # on the patched branch.
+          echo "Concretizing bzip2 ~shared %gcc..."
+          spack spec -I bzip2 ~shared %gcc
 
-          # On unpatched Spack the line below dies with:
-          #   ==> Error: KeyError: 'sonoma'
-          # (from lib/spack/spack/platforms/darwin.py:setup_platform_environment)
-          # On the patched branch sonoma is pre-registered so source build proceeds.
-          echo "Installing bzip2 (deps from cache, package source-built)..."
-          spack install \
-            --use-buildcache package:never,dependencies:auto \
-            --no-check-signature \
-            bzip2 os=sonoma
+          echo "Installing bzip2 ~shared %gcc..."
+          spack install --no-check-signature bzip2 ~shared %gcc
 
           echo "Installed packages:"
           spack find -v
@@ -139,5 +153,5 @@ jobs:
         if: failure()
         run: |
           . "$SPACK_ROOT/share/spack/setup-env.sh"
-          spack -d spec -I bzip2 os=sonoma || true
+          spack -d spec -I bzip2 ~shared %gcc || true
           spack buildcache list -a -l || true
