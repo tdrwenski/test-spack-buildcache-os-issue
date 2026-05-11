@@ -1,15 +1,39 @@
-name: repro-buildcache-os-mismatch
+name: repro-buildcache-os-keyerror
+
+# Reproduces the bug fixed by os-buildcache-fix (Spack issue #52062):
+# source-building a spec with os=sonoma on a sequoia host crashes with
+# `KeyError: 'sonoma'` in Darwin.setup_platform_environment because only
+# the host's OS is registered in operating_sys. The patch pre-registers
+# recent macOS versions so the lookup succeeds.
+#
+# Producer (macos-14): builds bzip2 + deps as os=sonoma, pushes only the
+# deps to a mirror so the consumer must source-build bzip2.
+# Consumer (macos-15, patched): installs bzip2 os=sonoma with deps from
+# cache and package source-built. Asserts the install succeeds.
 
 on:
   workflow_dispatch:
+    inputs:
+      spack_repo:
+        description: "Spack repo (owner/name) for both producer and consumer"
+        required: true
+        default: "spack/spack"
+      spack_ref:
+        description: "Spack branch or tag — use v1.1.1 to demo the bug"
+        required: true
+        default: "v1.1.1"
+
+env:
+  SPACK_REPO: ${{ inputs.spack_repo }}
+  SPACK_REF: ${{ inputs.spack_ref }}
 
 jobs:
   buildcache_macos_14:
     runs-on: macos-14
     steps:
-      - name: Checkout Spack v1.1.1
+      - name: Checkout Spack (${{ inputs.spack_ref }} from ${{ inputs.spack_repo }})
         run: |
-          git clone --depth 1 --branch v1.1.1 https://github.com/spack/spack.git
+          git clone --depth 1 --branch "$SPACK_REF" "https://github.com/${SPACK_REPO}.git"
           echo "SPACK_ROOT=$PWD/spack" >> $GITHUB_ENV
 
       - name: Setup Spack and show OS detection
@@ -25,19 +49,21 @@ jobs:
           spack arch -f
           spack debug report
 
-      - name: Concretize + build one package from source
+      - name: Build bzip2 from source (deps inherit os=sonoma)
         run: |
           . "$SPACK_ROOT/share/spack/setup-env.sh"
-          spack spec -I zlib
-          spack install zlib
-          spack find -v zlib
+          spack spec -I bzip2
+          spack install bzip2
+          spack find -v
 
-      - name: Create local binary buildcache mirror
+      - name: Push only the deps of bzip2 to a local buildcache mirror
         run: |
           . "$SPACK_ROOT/share/spack/setup-env.sh"
           mkdir -p mirror
           spack mirror add --type binary --unsigned local-buildcache "file://$(pwd)/mirror"
-          spack buildcache push --unsigned --update-index -f local-buildcache zlib
+          # --only=dependencies pushes bzip2's dep tree but not bzip2 itself.
+          # This forces the consumer to source-build bzip2.
+          spack buildcache push --unsigned --update-index --only=dependencies -f local-buildcache bzip2
           echo "Mirror contents:"
           find mirror -maxdepth 4 -type f | sed 's|^|  |'
 
@@ -56,9 +82,9 @@ jobs:
       MACOSX_DEPLOYMENT_TARGET: ""
       SYSTEM_VERSION_COMPAT: "0"
     steps:
-      - name: Checkout Spack v1.1.1
+      - name: Checkout Spack (${{ inputs.spack_ref }} from ${{ inputs.spack_repo }})
         run: |
-          git clone --depth 1 --branch v1.1.1 https://github.com/spack/spack.git
+          git clone --depth 1 --branch "$SPACK_REF" "https://github.com/${SPACK_REPO}.git"
           echo "SPACK_ROOT=$PWD/spack" >> $GITHUB_ENV
 
       - name: Download mirror artifact
@@ -79,38 +105,39 @@ jobs:
           SYSTEM_VERSION_COMPAT=0 sw_vers || true
           spack arch
           spack debug report
-          echo "Mirror index snippet:"
-          find mirror -maxdepth 3 -type f -name "index.json" -o -name "index.json.sig" | sed 's|^|  |' || true
+          echo "Mirror index files:"
+          find mirror -maxdepth 4 -type f -name "index.json*" | sed 's|^|  |' || true
 
-      - name: Add mirror and try to install cache-only
+      - name: Add mirror and force source-build of bzip2 with os=sonoma
         run: |
           . "$SPACK_ROOT/share/spack/setup-env.sh"
 
-          echo "Spec before adding buildcache mirror:"
-          spack spec -I zlib
-
-          echo "Adding buildcache mirror..."
           spack mirror add --type binary --unsigned local-buildcache "file://$(pwd)/mirror"
-          spack buildcache list -a -l zlib || true
 
-          echo "Spec after adding buildcache mirror:"
-          spack spec -I zlib
+          echo "Buildcache contents (deps built on macOS 14 = os=sonoma):"
+          spack buildcache list -a -l
 
-          # If Spack thinks the binary matches this host, it will install.
-          # If it thinks the binary is incompatible (e.g., OS mismatch), this should fail.
-          # Treat a successful install as a reproduction of the bug.
-          if spack install --use-buildcache only --no-check-signature zlib; then
-            echo "ERROR: buildcache install succeeded even though consumer is sequoia and mirror entry is sonoma." >&2
-            exit 1
-          else
-            echo "OK: cache-only install failed as expected for OS mismatch."
-          fi
+          echo "Concretizing bzip2 os=sonoma..."
+          spack spec -I bzip2 os=sonoma
+
+          # On unpatched Spack the line below dies with:
+          #   ==> Error: KeyError: 'sonoma'
+          # (from lib/spack/spack/platforms/darwin.py:setup_platform_environment)
+          # On the patched branch sonoma is pre-registered so source build proceeds.
+          echo "Installing bzip2 (deps from cache, package source-built)..."
+          spack install \
+            --use-buildcache package:never,dependencies:auto \
+            --no-check-signature \
+            bzip2 os=sonoma
 
           echo "Installed packages:"
-          spack find
+          spack find -v
+          echo "bzip2 os assignment:"
+          spack find -v bzip2 | grep -i "os=" || true
 
-      - name: Extra debug show matching / concretization details
-        if: always()
+      - name: Extra debug — show concretization details if anything went wrong
+        if: failure()
         run: |
           . "$SPACK_ROOT/share/spack/setup-env.sh"
-          spack -d spec -I zlib || true
+          spack -d spec -I bzip2 os=sonoma || true
+          spack buildcache list -a -l || true
