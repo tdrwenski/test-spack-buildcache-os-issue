@@ -7,13 +7,16 @@ name: repro-buildcache-os-keyerror
 #
 # Producer (macos-14): builds bzip2 and pushes everything to a mirror
 # (bzip2 + deps, all os=sonoma).
-# Consumer (macos-15): installs `bzip2 ~shared` — the variant flip
-# makes bzip2's hash differ from the cached entry, forcing source
-# build; its deps still match the cache and are reused as os=sonoma.
-# Note: with the default apple-clang compiler (host-pinned to sequoia),
-# the concretizer is likely to assign os=sequoia to the source-built
-# bzip2, so the KeyError may not actually trigger. The run still
-# exercises the buildcache reuse + source-build pipeline end-to-end.
+# Consumer (macos-15): installs `bzip2 ^libiconv libs:=static`. The
+# variant flip is on a DEP (libiconv) that already sits in the cached
+# sonoma subtree of bzip2's DAG, alongside diffutils/gmake. libiconv's
+# hash now differs from the cached entry → source build. Its parent
+# (diffutils) and siblings (gmake) are os=sonoma in cache, so the
+# solver is likely to keep libiconv os=sonoma for DAG cohesion — which
+# triggers the KeyError on unpatched Spack and succeeds on the patched
+# branch. Flipping a variant on bzip2 itself would have pinned bzip2
+# to os=sequoia (host) via the apple-clang constraint and not
+# reproduced the bug.
 
 on:
   workflow_dispatch:
@@ -110,7 +113,7 @@ jobs:
           echo "Mirror index files:"
           find mirror -maxdepth 4 -type f -name "index.json*" | sed 's|^|  |' || true
 
-      - name: Add mirror and install bzip2 ~shared (variant flip)
+      - name: Add mirror and install bzip2 ^libiconv libs:=static (dep variant flip)
         run: |
           . "$SPACK_ROOT/share/spack/setup-env.sh"
 
@@ -119,23 +122,25 @@ jobs:
           echo "Buildcache contents (built on macOS 14 = os=sonoma):"
           spack buildcache list -a -l
 
-          # The variant flip (~shared) makes bzip2's hash differ from the
-          # cached entry, forcing source build. Deps still match the cache
-          # and should be reused as os=sonoma.
-          echo "Concretizing bzip2 ~shared..."
-          spack spec -I bzip2 ~shared
+          # Flipping a variant on the libiconv dep (a sonoma-flavoured node in
+          # cache) makes its hash differ from the cached entry → source build.
+          # Surrounding deps stay os=sonoma, so the solver should keep libiconv
+          # os=sonoma for DAG cohesion. That source build triggers the KeyError
+          # on unpatched Spack and succeeds on the patched branch.
+          echo "Concretizing bzip2 ^libiconv libs:=static..."
+          spack spec -I bzip2 ^libiconv libs:=static
 
-          echo "Installing bzip2 ~shared..."
-          spack install --no-check-signature bzip2 ~shared
+          echo "Installing bzip2 ^libiconv libs:=static..."
+          spack install --no-check-signature bzip2 ^libiconv libs:=static
 
           echo "Installed packages:"
           spack find -v
-          echo "bzip2 os assignment:"
-          spack find -v bzip2 | grep -i "os=" || true
+          echo "libiconv os assignment:"
+          spack find -v libiconv | grep -i "os=" || true
 
       - name: Extra debug — show concretization details if anything went wrong
         if: failure()
         run: |
           . "$SPACK_ROOT/share/spack/setup-env.sh"
-          spack -d spec -I bzip2 ~shared || true
+          spack -d spec -I bzip2 ^libiconv libs:=static || true
           spack buildcache list -a -l || true
